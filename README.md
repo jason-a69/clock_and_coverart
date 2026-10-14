@@ -47,9 +47,11 @@ Yes, it's one hell of a faff to do without the adapter board.
 For the clock to work properly, you need to give your Pico2W access to the internet so that the internal clock can be updated using an NTP server. You also need to provide an offset to UTC which in my case is +8 for Taiwan 🇹🇼
 Create a file called cmake.secret after you have cloned this repository, this stores your WiFi information. The contents wold typically be
 
+```python
 set(SECRET_WIFI_SSID "Your WiFi SSID")
 set(SECRET_WIFI_PASSWORD "Your WiFi password")
 set(TIMEZONE_OFFSET_HOURS +8)
+```
 
 Write this file in the top level clock_and_coverart directory.
 
