@@ -1,0 +1,4 @@
+#pragma once
+
+#define WIFI_SSID "@SECRET_WIFI_SSID@"
+#define WIFI_PASSWORD "@SECRET_WIFI_PASSWORD@"

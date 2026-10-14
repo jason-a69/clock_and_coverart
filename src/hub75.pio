@@ -1,0 +1,567 @@
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+; The following source code has been derived from an example program of Raspberry Pi (Trading) Ltd..
+;
+.pio_version 0 // only requires PIO version 0
+
+
+; =============================================================================
+; PROGRAM: hub75_row
+; =============================================================================
+; Drives row selection, latching and brightness timing (BCM) for HUB75 panels.
+;
+; Responsibilities:
+;   - Synchronise with pixel streamer via IRQ handshake
+;   - Latch shifted pixel data into panel registers
+;   - Apply row address (A–E lines)
+;   - Generate BCM timing (lit/dark phases via OEn)
+;   - Trigger prefetch of next row while current row is displayed
+;
+; Data format (via DMA, 3 words per row/bit-plane):
+;   1. addr_delay  (packed: bits[4:0]=row_address, bits[31:5]=t_addr delay, PIO cycles)
+;   2. lit_cycles  (OEn active → LEDs ON)
+;   3. dark_cycles (OEn inactive → LEDs OFF)
+;
+.program hub75_row
+
+.side_set 2
+
+; Bit 0: LATCH (STB)
+; Bit 1: OEn (Output Enable, active LOW: 0=ON, 1=OFF)
+
+    ; --- INITIALISATION (executed once at start-up) ---
+    irq nowait 1        side 0b10   ; Kick off pixel streamer for the very first row
+    
+.wrap_target
+    ; -------------------------------------------------------------------------
+    ; 1. SYNC: wait until pixel data fully shifted
+    ; -------------------------------------------------------------------------
+    wait 1 irq 0        side 0b10   ; OEn=1 (panel OFF)
+
+    mov x, y            side 0b10
+latch_guard_wait:
+    jmp x-- latch_guard_wait side 0b10
+
+    ; -------------------------------------------------------------------------
+    ; 2. LATCH: clean pulse (HIGH followed by LOW in register stabilisation)
+    ; -------------------------------------------------------------------------
+    mov x, y    [3]     side 0b11   ; STB=1, OE=1  (Latch HIGH)
+
+    ; -------------------------------------------------------------------------
+    ; 3. LATCH SETTLE: allow internal register stabilisation
+    ; -------------------------------------------------------------------------
+wait_latch_settle:
+    jmp x-- wait_latch_settle side 0b10
+
+    ; -------------------------------------------------------------------------
+    ; 4. PREFETCH next row data (parallel to blanking)
+    ; -------------------------------------------------------------------------
+    irq nowait 1        side 0b10
+
+    ; -------------------------------------------------------------------------
+    ; 5. ADDRESSING + t_addr: set row AFTER latch is fully stable, then
+    ;    consume the rest of the same packed word as the address-settle delay.
+    ;    The word is split 5 + 27:
+    ;      bits [4:0] = row address (A–E)
+    ;      bits [31:5] = t_addr
+    ; -------------------------------------------------------------------------
+    out pins, 5          side 0b10   ; Output A–E row address (low 5 bits of packed word)
+    out x, 27            side 0b10   ; load t_addr delay (upper 27 bits) into X register
+addr_wait:
+    jmp x-- addr_wait side 0b10
+
+    ; -------------------------------------------------------------------------
+    ; 6. DISPLAY (BCM ON phase)
+    ; -------------------------------------------------------------------------
+    out x, 32           side 0b10   ; load lit_cycles
+lit_loop:
+    jmp x-- lit_loop    side 0b00   ; OE=0 → LEDs ON
+
+    ; -------------------------------------------------------------------------
+    ; 7. BLANKING (BCM OFF phase)
+    ; -------------------------------------------------------------------------
+    out x, 32           side 0b10   ; load dark_cycles
+dark_loop:
+    jmp x-- dark_loop   side 0b10   ; OE=1 → LEDs OFF
+
+.wrap
+
+% c-sdk {
+    static inline void hub75_row_program_init(PIO pio, uint sm, uint offset, uint row_base_pin, uint n_row_pins, uint latch_base_pin, uint t_latch, bool inverted_stb)
+    {
+        pio_sm_set_consecutive_pindirs(pio, sm, row_base_pin, n_row_pins, true);
+        pio_sm_set_consecutive_pindirs(pio, sm, latch_base_pin, 2, true);
+
+        for (uint i = row_base_pin; i < row_base_pin + n_row_pins; ++i)
+            pio_gpio_init(pio, i);
+
+        pio_gpio_init(pio, latch_base_pin);     // aka STROBE pin
+        pio_gpio_init(pio, latch_base_pin + 1); // OEn pin
+
+        if ( inverted_stb) {
+            // Inverts the STROBE (latch) pin output at the GPIO pad level.
+            // The PIO SM continues to output standard active-HIGH pulses, but the physical pin outputs active-LOW signals to the panel!
+            gpio_set_outover(latch_base_pin, GPIO_OVERRIDE_INVERT);
+        }
+
+        pio_sm_config c = hub75_row_program_get_default_config(offset);
+        sm_config_set_out_pins(&c, row_base_pin, n_row_pins);
+        sm_config_set_sideset_pins(&c, latch_base_pin); // STROBE pin and OEn pin
+        sm_config_set_in_shift(&c, true, true, 32);
+        sm_config_set_out_shift(&c, true, true, 32);
+
+        pio_sm_init(pio, sm, offset, &c);
+
+        // Part of Pimoronis anti ghosting solution https://github.com/pimoroni/pimoroni-pico/commit/9e7c2640d426f7b97ca2d5e9161d3f0a00f21abf
+        // Load wait_cycles into Y-register (t_latch)
+        pio_sm_exec(pio, sm, pio_encode_out(pio_y, 32));
+        pio_sm_put(pio, sm, t_latch);
+
+        pio_sm_set_enabled(pio, sm, true);
+    }
+%}
+
+; =============================================================================
+; PROGRAM: hub75_row_abc_shift_register
+; =============================================================================
+; Row control for ABC shift-register panels using three row-select pins:
+;   A = row clk
+;   B = BK  (discharge enable - anti-ghosting; per RT5956/RT5958D pinout)
+;   C = row data
+;
+; The DMA row word packs two 3-bit pin states plus the address-settle delay:
+;   bits [2:0]   = phase 0 (A low, B high, C=data)
+;   bits [5:3]   = phase 1 (A high, B high, C=data)
+;   bits [31:6]  = t_addr
+; The two `out pins, 3` at the start of step 5 re-drive A/B/C on two clock edges — that is what
+; advances the shift register. hub75_row has no shift register behind it and uses direct binary
+; addressing via `out pins, 5`, so all three of step 5's outputs differ between the two programs.
+;
+.program hub75_row_abc_shift_register
+
+.side_set 2
+; Bit 0: LATCH (STB)
+; Bit 1: OEn (Output Enable, active LOW: 0=ON, 1=OFF)
+
+    ; --- INITIALISATION (executed once at start-up) ---
+    irq nowait 1        side 0b10   ; Kick off pixel streamer for the very first row
+
+.wrap_target
+    ; -------------------------------------------------------------------------
+    ; 1. SYNC: wait until pixel data fully shifted
+    ; -------------------------------------------------------------------------
+    wait 1 irq 0        side 0b10   ; OEn=1 (panel OFF)
+
+    mov x, y            side 0b10
+latch_guard_wait_abc_sr:
+    jmp x-- latch_guard_wait_abc_sr side 0b10
+
+    ; -------------------------------------------------------------------------
+    ; 2. LATCH: clean pulse (HIGH followed by LOW in register stabilisation)
+    ; -------------------------------------------------------------------------
+    mov x, y    [3]     side 0b11   ; STB=1, OE=1  (Latch HIGH)
+
+    ; -------------------------------------------------------------------------
+    ; 3. LATCH SETTLE: allow internal register stabilisation
+    ; -------------------------------------------------------------------------
+wait_latch_settle_abc_sr:
+    jmp x-- wait_latch_settle_abc_sr side 0b10
+
+    ; -------------------------------------------------------------------------
+    ; 4. PREFETCH next row data (parallel to blanking)
+    ; -------------------------------------------------------------------------
+    irq nowait 1        side 0b10
+
+    ; -------------------------------------------------------------------------
+    ; 5. ROW ADDRESSING + t_addr DELAY:
+    ;    CLK [0:0]   Shift register clock
+    ;    BK  [1:1]   Discharge enable control
+    ;    DIN [2:2]   Data in
+    ;
+    ;    For the ABC shift register, the following values are sent for row addressing of the shift
+    ;    register. Row 0 injects the one-hot 1, every row after that clocks it one step on:
+    ;        phase0 = 0b110  OSR bits [2:0]   ; row 0        (C=1, injects the 1)
+    ;        phase1 = 0b111  OSR bits [5:3]   ; row 0        (A=1, clocks it in)
+    ;        phase0 = 0b010  OSR bits [2:0]   ; rows 1..N-1  (C=0)
+    ;        phase1 = 0b011  OSR bits [5:3]   ; rows 1..N-1  (A=1, clocks it forward)
+    ;    t_addr delay        OSR bits [31:6]
+    ; -------------------------------------------------------------------------
+    out pins, 3         side 0b10  ; phase0
+    out pins, 3         side 0b10  ; phase1
+    out x, 26           side 0b10   ; load t_addr delay (upper 26 bits) into X register
+addr_wait_abc_sr:
+    jmp x-- addr_wait_abc_sr side 0b10
+
+    ; -------------------------------------------------------------------------
+    ; 6. DISPLAY (BCM ON phase)
+    ; -------------------------------------------------------------------------
+    out x, 32           side 0b10   ; load lit_cycles
+lit_loop_abc_sr:
+    jmp x-- lit_loop_abc_sr side 0b00   ; OE=0 → LEDs ON
+
+    ; -------------------------------------------------------------------------
+    ; 7. BLANKING (BCM OFF phase)
+    ; -------------------------------------------------------------------------
+    out x, 32           side 0b10   ; load dark_cycles
+dark_loop_abc_sr:
+    jmp x-- dark_loop_abc_sr side 0b10   ; OE=1 → LEDs OFF
+
+.wrap
+
+% c-sdk {
+    static inline void hub75_row_abc_shift_register_program_init(PIO pio, uint sm, uint offset, uint row_base_pin, uint n_row_pins, uint latch_base_pin, uint t_latch, bool inverted_stb)
+    {
+        pio_sm_set_consecutive_pindirs(pio, sm, row_base_pin, n_row_pins, true);
+        pio_sm_set_consecutive_pindirs(pio, sm, latch_base_pin, 2, true);
+
+        for (uint i = row_base_pin; i < row_base_pin + n_row_pins; ++i)
+            pio_gpio_init(pio, i);
+
+        pio_gpio_init(pio, latch_base_pin);
+        pio_gpio_init(pio, latch_base_pin + 1);
+
+        if ( inverted_stb) {
+            // Inverts the STROBE (latch) pin output at the GPIO pad level.
+            // The PIO SM continues to output standard active-HIGH pulses, but the physical pin outputs active-LOW signals to the panel!
+            gpio_set_outover(latch_base_pin, GPIO_OVERRIDE_INVERT);
+        }
+
+        pio_sm_config c = hub75_row_abc_shift_register_program_get_default_config(offset);
+        sm_config_set_out_pins(&c, row_base_pin, n_row_pins);
+        sm_config_set_sideset_pins(&c, latch_base_pin);
+        sm_config_set_in_shift(&c, true, true, 32);
+        sm_config_set_out_shift(&c, true, true, 32);
+
+        pio_sm_init(pio, sm, offset, &c);
+        pio_sm_exec(pio, sm, pio_encode_out(pio_y, 32));
+        pio_sm_put(pio, sm, t_latch);
+        pio_sm_set_enabled(pio, sm, true);
+    }
+%}
+
+; =============================================================================
+; PROGRAM: hub75_bitplane_stream
+; =============================================================================
+; Streams pixel data (bitplanes) into HUB75 shift registers.
+;
+; Responsibilities:
+;   - Wait for row engine to request next row (IRQ handshake)
+;   - Shift RGB data (6 parallel lines: R0,G0,B0,R1,G1,B1)
+;   - Generate clock pulses (side-set)
+;   - Signal completion back to row engine
+;
+; Data format:
+;   - Each byte: [xx R0 G0 B0 R1 G1 B1]
+;   - Lower 6 bits used, upper 2 bits discarded
+;
+.program hub75_bitplane_stream
+
+; side-set pin 0 is CLK (Clock)
+
+.side_set 1
+
+.wrap_target
+    ; --- PREPARATION ---
+    ; Load the panel width (e.g., 64 or 128) from the Y register into X as a loop counter
+    mov x, y            side 0 ; CLK ↓
+
+    ; Wait for a signal from the 'hub75_row' program to start shifting the next row
+    wait 1 irq 1        side 0 ; CLK ↓
+
+bitstream_loop:
+    ; --- PIXEL DATA SHIFTING ---
+    ; Pull 6 bits (R0, G0, B0, R1, G1, B1) and apply to pins. 
+    ; [1] adds a small setup delay before the rising clock edge.
+    out pins, 6    [3]      side 0 ; CLK ↓
+
+    ; Discard the remaining 2 bits of the byte (padding) to trigger DMA auto-pull
+    ; and pulse the clock high to shift the data into the panel's shift registers
+    out null, 2    [3]      side 1 ; CLK ↑, [3] extends the hold time
+
+    ; Loop until full row transferred
+    jmp x--, bitstream_loop side 0 ; CLK ↓
+
+    ; --- SYNCHRONIZATION ---
+    ; Notify the 'hub75_row' program that the panels shift registers for this row are complete
+    irq nowait 0            side 0 ; CLK ↓
+.wrap
+
+% c-sdk {
+    static inline void hub75_bitplane_stream_program_init(PIO pio, uint sm, uint offset, uint rgb_base_pin, uint clock_pin, uint panel_width)
+    {
+        pio_sm_set_consecutive_pindirs(pio, sm, rgb_base_pin, 6, true);
+        pio_sm_set_consecutive_pindirs(pio, sm, clock_pin, 1, true);
+        for (uint i = rgb_base_pin; i < rgb_base_pin + 6; ++i)
+            pio_gpio_init(pio, i);
+        pio_gpio_init(pio, clock_pin);
+
+        pio_sm_config c = hub75_bitplane_stream_program_get_default_config(offset);
+        sm_config_set_out_pins(&c, rgb_base_pin, 6);
+        sm_config_set_sideset_pins(&c, clock_pin);
+        sm_config_set_out_shift(&c, true, true, 8);
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+        pio_sm_init(pio, sm, offset, &c);
+
+        // Inject a single `out y, N` instruction directly into the state machine, bypassing the normal program counter.
+        // Because out reads from the OSR, and autopull is enabled, the state machine stalls waiting for the OSR to be refilled from the TX FIFO.
+        pio_sm_exec(pio, sm, pio_encode_out(pio_y, 32));
+        // Push the actual value into the FIFO, which unstalls the machine, autopulls that value into the OSR, and the injected out shifts it into y.
+        pio_sm_put(pio, sm, panel_width - 1);
+
+        pio_sm_set_enabled(pio, sm, true);
+    }
+%}
+
+; =============================================================================
+; PROGRAM: hub75_bitplane_setup
+; =============================================================================
+; Converts packed RGB bitplanes (R10G10B10 or R8G8B8) into serialised
+; 6-bit output words suitable for hub75_bitplane_stream.
+;
+; Responsibilities:
+;   - Extract individual bitplanes from packed RGB words
+;   - Interleave top/bottom pixel pairs (R0/G0/B0 + R1/G1/B1)
+;   - Push formatted bytes into FIFO for streaming
+;
+; Uses self-modifying code:
+;   - `pull` instructions may be patched to `out null, n`
+;
+.program hub75_bitplane_setup
+.define BITPLANES 10         ; Alias - valid for 10 and for 8 BITPLANES!
+
+.wrap_target  
+    set x, 1                 ; loop counter
+
+                             ; first word R10G10B10 or R8G8B8    
+                             ; followed by second word R10G10B10 or R8G8B8 in second loop iteration
+                             ; pre-shift left to current bitplane n if n nonzero
+                             ; else no pre-shift necessary      
+public shift:                ; Pixel Red0 Green0 Blue0 (8 or 10 bit format)
+    pull                     ; Instruction gets patched to `out null, n` if n nonzero (otherwise the PULL is required for fencing)
+                             ; pre-shift left to current bitplane n if n nonzero
+                             ; else no pre-shift necessary
+    in osr, 1                ; shift right into ISR register first OSR bit: Red0 
+                             ; second iteration: shift right into ISR register first OSR bit:  Red1 Blue0 Green0 RED0
+    out null, BITPLANES      ; shift to green bit
+
+    in osr, 1                ; shift right into ISR register first OSR bit:  Green0 RED0
+                             ; second iteration: shift right into ISR register first OSR bit: Green1 Red1 Blue0 Green0 RED0
+    out null, BITPLANES      ; shift to blue bit
+
+    in osr, 1                ; shift right into ISR register first OSR bit: Blue0 Green0 RED0
+                             ; second iteration: shift right into ISR register first OSR bit: Blue1 Green1 Red1 Blue0 Green0 RED0
+    out null, 32             ; Discard rest to trigger auto-pull
+    
+    jmp x-- shift
+
+    in null, 2               ; shift right and after 4 loops auto push four bytes (each byte looks like 00B1G1R1B0G0R0) from ISR into the RX FIFO
+
+.wrap
+
+% c-sdk {
+static inline void hub75_bitplane_setup_program_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = hub75_bitplane_setup_program_get_default_config(offset);
+
+    sm_config_set_out_shift(&c, true, true, 32);
+
+    // ISR shift to right. Autopush enabled. Shift 32 bits (complete word)
+    sm_config_set_in_shift(&c, true, true, 32);
+
+    pio_sm_init(pio, sm, offset, &c);
+
+    pio_sm_exec(pio, sm, offset);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+// Patch hub75_bitplane_setup program at `offset` to preshift pixels by `shamt`
+static inline void hub75_bitplane_setup_set_shift(PIO pio, uint sm, uint offset, uint shamt) {
+    uint16_t instr;
+    if (shamt == 0)
+        instr = pio_encode_pull(false, true); // blocking PULL
+    else
+        instr = pio_encode_out(pio_null, shamt);
+    pio->instr_mem[offset + hub75_bitplane_setup_offset_shift] = instr;
+}
+%}
+
+; =============================================================================
+; PROGRAM: rul6024_write_register
+; =============================================================================
+; Shifts a 16-bit "register" value into a chain of RUL6024 driver ICs and
+; issues an LE-length command telling the chain what that value means
+; (WR_REG1, WR_REG2, DATA_LATCH, ...). See rul6024.h for the full command
+; table and rul6024.cpp for how the C-side buffer is built.
+;
+; Pin roles ("set pins", 3 consecutive pins starting at clk_le_base_pin,
+; configured in rul6024_write_register_program_init below):
+;   bit0 (clk_le_base_pin + 0) = CLK   (shift clock)
+;   bit1 (clk_le_base_pin + 1) = LE    (a.k.a. STROBE — command-length pin)
+;   bit2 (clk_le_base_pin + 2) = OEN   (output enable, active LOW on the
+;                                       panel; this program deliberately
+;                                       holds it HIGH — blanked — for the
+;                                       whole configuration write so no
+;                                       write-glitch is ever visible on
+;                                       the physical display)
+; "out pins, 6" targets 6 consecutive data pins (data_base_pin..+5), one
+; bit per RGB sub-pixel lane, driven identically for every chip in the
+; chain (see prepare_register_dma() — the same 16-bit value is shifted
+; once per daisy-chained chip).
+;
+; Wire protocol, per call to rul6024_write_register() (C-SDK helper below):
+;
+;   Phase 1 (once): receive `data_length = display_width - cmd_signature`,
+;     the number of CLK pulses to send with LE held LOW.
+;   Phase 2 (data_loop, `data_length` iterations): shift the leading
+;     portion of the register image in with LE LOW. This is still real
+;     register data — the RUL6024 keeps shifting on every CLK pulse
+;     regardless of LE; LE only marks pulses for the *command signature*.
+;   Phase 3 (le_data_loop, `cmd_signature` iterations): shift the
+;     remaining `cmd_signature` pulses in with LE HIGH. Together with
+;     Phase 2 this clocks in exactly `display_width` bits total (one full
+;     pass through the chain), and the trailing run of `cmd_signature`
+;     LE-high pulses is what the chip decodes as the command (11 = WREG1,
+;     12 = WREG2, ...) once CLK stops toggling.
+;
+; Timing: sm_config_set_clkdiv(&c, 10.0f) reduces the PIO clock
+; relative to sys_clk. Each `set pins ... [7]` instruction then holds its
+; pin state for 8 PIO cycles (1 issue cycle + [7] delay cycles) before the
+; next `set`. If you ever change sys_clk or clkdiv, recompute the
+; resulting CLK high/low time and re-check it against the RUL6024's timing
+; spec (rise/fall + minimum pulse width) rather than assuming 8 cycles is
+; still enough margin.
+.program rul6024_write_register
+.wrap_target
+    ; ---- Phase 1: latch in the data/command split point for this write ----
+    pull block
+    out x, 32               ; x = data_length - 1 (CLK pulses to send with LE low)
+    set pins, 0b100 [7]     ; OEN=1 (blanked), LE=0, CLK=0 — idle/rest state
+
+    ; ---- Phase 2: shift register data in, LE low (not yet part of the command signature) ----
+data_loop:
+    pull block
+    out pins, 6              ; drive this cycle's 6 data lanes (1 bit/lane, all chips identical)
+    set pins, 0b101 [7]      ; OEN=1 LE=0 CLK=1  (chip samples data on this rising edge)
+    set pins, 0b100 [7]      ; OEN=1 LE=0 CLK=0
+    jmp x-- data_loop
+
+    ; ---- Phase 3: shift the final cmd_signature bits in with LE held high ----
+    ;              (LE-high pulse *count*, not the data itself, selects the command)
+    pull block
+    out x, 32                ; x = cmd_signature - 1   e.g. 11->10 for WREG1, 12->11 for WREG2
+    set pins, 0b110 [7]
+le_data_loop:
+    pull block
+    out pins, 6              ; still real shift-register data — LE doesn't gate data, only marks the command
+    set pins, 0b111 [7]      ; OEN=1 LE=1 CLK=1  (data sampled on this rising edge)
+    set pins, 0b110 [7]      ; OEN=1 LE=1 CLK=0
+    jmp x-- le_data_loop
+
+.wrap
+
+%c-sdk {
+    // Configures GPIO directions/muxing and the state machine for rul6024_write_register. 
+    // Call once per chain before any rul6024_write_register() calls; 
+    // the SM stays enabled and reusable for repeated writes (WREG1, then WREG2, ...) until the caller tears it down (see rul6024_initialize() in rul6024.cpp).
+    //
+    //   data_base_pin    -> first of 6 consecutive RGB data lane pins
+    //   clk_le_base_pin  -> CLK; clk_le_base_pin+1 and +2 must be LE and
+    //                       OEN respectively (i.e. CLK/LE/OEN are assumed
+    //                       wired to three *consecutive* GPIOs)
+    //
+    static inline void rul6024_write_register_program_init(PIO pio, uint sm, uint offset, uint data_base_pin, uint clk_le_base_pin)
+    {
+        pio_sm_set_enabled(pio, sm, false);
+        pio_sm_clear_fifos(pio, sm);
+
+        pio_sm_set_consecutive_pindirs(pio, sm, data_base_pin, 6, true);
+        pio_sm_set_consecutive_pindirs(pio, sm, clk_le_base_pin, 3, true);
+        for (uint i = 0; i < 6; i++)
+            pio_gpio_init(pio, data_base_pin + i);
+        pio_gpio_init(pio, clk_le_base_pin);     // CLK
+        pio_gpio_init(pio, clk_le_base_pin + 1); // LE
+        pio_gpio_init(pio, clk_le_base_pin + 2); // OEN
+
+        pio_sm_config c = rul6024_write_register_program_get_default_config(offset);
+        sm_config_set_out_pins(&c, data_base_pin, 6);
+        sm_config_set_set_pins(&c, clk_le_base_pin, 3);
+        sm_config_set_out_shift(&c, true, false, 32); // shift_right=true, autopull off (all pulls explicit)
+
+        // Halves the PIO clock relative to sys_clk. 
+        // Combined with the program's `[7]` delays this sets CLK high/low time.
+        // See the timing note above the .program declaration if this ever changes.
+        sm_config_set_clkdiv(&c, 10.0f);
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+        pio_sm_init(pio, sm, offset, &c);
+        pio_sm_set_enabled(pio, sm, true);
+    }
+
+    // Issues one register write: shifts `dma_words[0 .. display_width-1]` into the chain (one 6-bit word per CLK pulse) and 
+    // asserts LE for the trailing `cmd_signature` of those pulses, so the chain latches the shifted-in value as the command identified by cmd_signature 
+    // (e.g. CMD_WREG1 = 11, CMD_WREG2 = 12 — see rul6024.h).
+    //
+    // dma_words must hold exactly `display_width` entries, pre-expanded by prepare_register_dma() in rul6024.cpp.
+    // This function only streams them to the PIO FIFO, it does no encoding of its own.
+    static inline void rul6024_write_register(PIO pio, uint sm, uint32_t display_width, uint32_t cmd_signature, const uint32_t *dma_words)
+    {
+        uint16_t data_length = display_width - cmd_signature; // LE-low portion (Phase 2)
+
+        pio_sm_put_blocking(pio, sm, data_length - 1); // Phase 1: loop count for data_loop
+        for (uint32_t i = 0; i < data_length; i++)
+        {
+            pio_sm_put_blocking(pio, sm, dma_words[i]);
+        }
+
+        pio_sm_put_blocking(pio, sm, cmd_signature - 1); // Phase 3: loop count for le_data_loop
+        for (uint32_t i = data_length; i < data_length + cmd_signature; i++)
+        {
+            pio_sm_put_blocking(pio, sm, dma_words[i]);
+        }
+    }
+
+    // Issues the DATA_LATCH command (LE length = 3, see rul6024.h's LE-length
+    // table) on the same rul6024_write_register PIO program/state machine
+    // already set up by rul6024_write_register_program_init(). Unlike
+    // WREG1/WREG2, DATA_LATCH carries no payload of its own - the chip only
+    // decodes the trailing LE-high pulse count once CLK stops toggling, so
+    // what gets shifted through beforehand doesn't matter.
+    //
+    // rul6024_write_register()'s "jmp x--" loop idiom can't do a genuine
+    // zero-iteration pass (x = 0 still runs the loop body once before the
+    // exit test), so the shortest legal transaction is 1 LE-low dummy pulse
+    // followed by the 3 LE-high pulses -> display_width = 4 here, not the
+    // panel's real display_width. The dummy data is all zero since the
+    // DATA pins are "don't care" for this command.
+    static inline void rul6024_data_latch(PIO pio, uint sm)
+    {
+        static const uint32_t latch_dummy[4] = {0, 0, 0, 0};
+        const uint32_t le_length_data_latch = 3; // CMD_DATA_LATCH, see rul6024.h
+        rul6024_write_register(pio, sm, /*display_width=*/4, /*le=*/3, latch_dummy);
+    }
+    // Issues the RESET_OEN command: per rul6024.h's LE-length table this is
+    // a *two-step* command, not a single one - one transaction with LE
+    // held high for 1 pulse, immediately followed by a second transaction
+    // with LE held high for 2 pulses. The old bit-banged implementation
+    // (rul6024_old.cpp) spelled this out by hand with a long run of
+    // gpio_put() calls; this reproduces the same two LE-length steps on the
+    // PIO program instead.
+    //
+    // As with rul6024_data_latch(), RESET_OEN carries no payload - only the
+    // LE-high pulse count of each step matters - so both steps reuse the
+    // same small all-zero dummy buffer, sized for the longer of the two
+    // (display_width = 3 for the LE-length-2 step). The "jmp x--" loop
+    // idiom's minimum-1-iteration quirk (see rul6024_data_latch() above)
+    // is why display_width is 2 and 3, not 1 and 2.
+    static inline void rul6024_reset_oen(PIO pio, uint sm)
+    {
+        static const uint32_t reset_oen_dummy[3] = {0, 0, 0};
+        const uint32_t le_length_reset_oen_step1 = 1; // CMD_RESET_OEN_STEP1, see rul6024.h
+        const uint32_t le_length_reset_oen_step2 = 2; // CMD_RESET_OEN_STEP2, see rul6024.h
+
+        rul6024_write_register(pio, sm, /*display_width=*/2, le_length_reset_oen_step1, reset_oen_dummy);
+        rul6024_write_register(pio, sm, /*display_width=*/3, le_length_reset_oen_step2, reset_oen_dummy);
+    }
+%}
