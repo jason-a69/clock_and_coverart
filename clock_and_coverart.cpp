@@ -23,14 +23,6 @@ static PicoGraphics_PenRGB888 graphics(96, 48, nullptr);
 #define M_PI (3.14159265358979323846)
 #endif
 
-// Define these parameters in a file called config.txt
-
-//const char* WIFI_SSID = std::getenv("WIFI_SSID");
-//const char* WIFI_PASSWORD = std::getenv("WIFI_PASSWORD");
-//const char* TIMEZONE_OFFSET_HOURS = std::getenv("TIMEZONE_OFFSET_HOURS");
-
-
-
 #include <stdio.h>
 #include <stdlib.h>     // needed for setenv(), although also included by lwIP
 #include "pico/stdlib.h"
