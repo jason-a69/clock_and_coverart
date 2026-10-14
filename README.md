@@ -8,8 +8,11 @@ Those 2 guys helped me a lot, getting the driver in shape for the Waveshare pane
 
 Hardware required :
     Pico2W
+
     RGB Matrix Adapter Board (https://seengreat.com/product/194/rgb-matrix-adapter-board)
+
     Waveshare 96x48 RGB panel (I sourced mine from Taobao)
+    
     Power bank 
 
 The RGB Matrix Apapter Board is not essential but it really helps with the wiring. If you do use one then the pins will change in the code.
