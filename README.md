@@ -7,13 +7,10 @@ https://github.com/JuPfu/hub75/
 Those 2 guys helped me a lot, getting the driver in shape for the Waveshare panel and offering invaluable guidance, I cannot thank them enough. I have used their code as a starting point for this project.
 
 Hardware required :
-    Pico2W
-
-    RGB Matrix Adapter Board (https://seengreat.com/product/194/rgb-matrix-adapter-board)
-
-    Waveshare 96x48 RGB panel (I sourced mine from Taobao)
-    
-    Power bank 
+- Pico2W
+- RGB Matrix Adapter Board (https://seengreat.com/product/194/rgb-matrix-adapter-board)
+- Waveshare 96x48 RGB panel (I sourced mine from Taobao)
+- Power supply (I sourced mine from a local shop in Taiwan) 
 
 The RGB Matrix Apapter Board is not essential but it really helps with the wiring. If you do use one then the pins will change in the code.
 
@@ -44,6 +41,20 @@ Without
 You need to refer to the Waveshare documentation on how to connect your panel to your Pico which is here
 
 https://docs.waveshare.com/RGB-Matrix-Px-96x48/Raspberry-Pico
+
+Yes, it's one hell of a faff to do without the adapter board.
+
+For the clock to work properly, you need to give your Pico2W access to the internet so that the internal clock can be updated using an NTP server. You also need to provide an offset to UTC which in my case is +8 for Taiwan 🇹🇼
+Create a file called cmake.secret after you have cloned this repository, this stores your WiFi information. The contents wold typically be
+
+set(SECRET_WIFI_SSID "Your WiFi SSID")
+set(SECRET_WIFI_PASSWORD "Your WiFi password")
+set(TIMEZONE_OFFSET_HOURS +8)
+
+Write this file in the top level clock_and_coverart directory.
+
+
+
 
 
 

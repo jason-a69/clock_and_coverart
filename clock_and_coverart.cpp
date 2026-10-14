@@ -14,7 +14,6 @@
 
 #include "pico/aon_timer.h"
 
-//#include "antialiased_line.hpp"
 
 using namespace pimoroni;
 static PicoGraphics_PenRGB888 graphics(96, 48, nullptr);
@@ -24,7 +23,7 @@ static PicoGraphics_PenRGB888 graphics(96, 48, nullptr);
 #endif
 
 #include <stdio.h>
-#include <stdlib.h>     // needed for setenv(), although also included by lwIP
+#include <stdlib.h>
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "lwip/apps/sntp.h"
@@ -51,7 +50,7 @@ struct TCP_SERVER_T {
     struct tcp_pcb *client_pcb;
 };
 
-#define TIMEZONE_OFFSET_HOURS (+8) // Change to your local UTC offset (e.g. -5 for EST, +1 for CET)
+//#define TIMEZONE_OFFSET_HOURS (+8) // Change to your local UTC offset (e.g. -5 for EST, +1 for CET)
 
 
 // Full panel size
@@ -73,8 +72,8 @@ static uint8_t screen_buf[PANEL_W * PANEL_H * 3];
 // Matches a single generic 64x64 panel wired to GPIO 0-13.
 constexpr Hub75Config panel_cfg{
     .panel = {
-        .matrix_panel_width = 96,
-        .matrix_panel_height = 48,
+        .matrix_panel_width = PANEL_W,
+        .matrix_panel_height = PANEL_H,
         .chain_rows = 1,
         .chain_cols = 1,
         .chain_mode = Hub75ChainMode::SERPENTINE,
@@ -178,8 +177,8 @@ void core1_entry()
 // This is called from lwipopts.h
 void sntp_set_system_time_us(uint32_t sec, uint32_t us) {    
     static struct timespec ntp_ts;
-    // Calculate the offset required for where we are
-    ntp_ts.tv_sec = sec + (3600 * TIMEZONE_OFFSET_HOURS);
+    // Calculate the offset required for where we are, this variable is set in cmake.secret. Convert that to an integer first
+    ntp_ts.tv_sec = sec + (3600 * std::stoi(TIMEZONE_OFFSET_HOURS));
     ntp_ts.tv_nsec = us * 1000;
 
     if (aon_timer_is_initialised) {
@@ -413,7 +412,6 @@ public:
                     this->set_pixel(Point(x, y)); 
                 }
             }
-            //this->clear();
 
             this->set_pen(clock_digits);
 
