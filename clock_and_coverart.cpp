@@ -43,6 +43,8 @@ static bool aon_timer_is_initialised = false;
 #define IMG_SIZE (96 * 48 * 3)   // RGB888
 
 static uint8_t image_buf[IMG_SIZE];
+static uint8_t next_image_buf[IMG_SIZE];
+
 static size_t  recv_len = 0;
 static bool    image_ready = false;
 
@@ -50,9 +52,6 @@ struct TCP_SERVER_T {
     struct tcp_pcb *server_pcb;
     struct tcp_pcb *client_pcb;
 };
-
-//#define TIMEZONE_OFFSET_HOURS (+8) // Change to your local UTC offset (e.g. -5 for EST, +1 for CET)
-
 
 // Full panel size
 constexpr int PANEL_W = 96;
@@ -288,6 +287,7 @@ static bool tcp_server_open() {
         printf("Server error in struct tcp_pcb %s\n", server);
         return false;
     }
+
     tcp_accept(server, tcp_server_accept);
     return true;
 }
@@ -460,6 +460,7 @@ public:
           
             if (image_ready) {
 
+                image_ready = false;
                 // Draw the BMP on the right side of the screen
                 for (int y = 0; y < IMG_H; ++y) {
                     for (int x = 0; x < IMG_W; ++x) {
@@ -473,9 +474,7 @@ public:
                         this->set_pixel(Point(OFFSET_X + x, OFFSET_Y + y));
                     }
                 }
-
             }
-            
         }
 
     }
