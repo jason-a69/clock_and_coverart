@@ -50,8 +50,10 @@ Create a file called cmake.secret after you have cloned this repository, this st
 ```python
 set(SECRET_WIFI_SSID "Your WiFi SSID")
 set(SECRET_WIFI_PASSWORD "Your WiFi password")
-set(TIMEZONE_OFFSET_HOURS +8)
+set(SECRET_TX "CST-8")
 ```
+
+See https://www.veron.nl/wp-content/uploads/2022/12/Posix-Timezone-Strings.pdf for your posix timezone string
 
 Write this file in the top level clock_and_coverart directory.
 

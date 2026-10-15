@@ -32,6 +32,7 @@ static PicoGraphics_PenRGB888 graphics(96, 48, nullptr);
 #include "pico/mutex.h"
 #include "lwip/tcp.h"
 #include <cstring>
+#include <time.h>
 
 
 // create a mutex to avoid reading the aon_timer at the same time as lwIP/SNTP is updating it 
@@ -178,7 +179,16 @@ void core1_entry()
 void sntp_set_system_time_us(uint32_t sec, uint32_t us) {    
     static struct timespec ntp_ts;
     // Calculate the offset required for where we are, this variable is set in cmake.secret. Convert that to an integer first
-    ntp_ts.tv_sec = sec + (3600 * std::stoi(TIMEZONE_OFFSET_HOURS));
+    
+    printf("Updating time to match timezone %s\n",TZ);
+    setenv("TZ", TZ, 1);
+    tzset();
+    
+    int offset_seconds = (int)(-_timezone);
+
+    printf("Offset seconds from the timezone is %d\n", offset_seconds);
+
+    ntp_ts.tv_sec = sec + offset_seconds;
     ntp_ts.tv_nsec = us * 1000;
 
     if (aon_timer_is_initialised) {
@@ -252,7 +262,7 @@ static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
 
 static err_t tcp_server_accept(void *arg, struct tcp_pcb *client_pcb, err_t err) {
     if (err != ERR_OK || client_pcb == NULL) {
-        printf("Returning, error in tcp_server_accept\n");
+        printf("Returning, error in tcp_server_accept %s\n",err);
         return ERR_VAL;
     }
     tcp_recv(client_pcb, tcp_server_recv);
@@ -264,7 +274,7 @@ static bool tcp_server_open() {
     printf("In tcp_server_open\n");
 
     if (!pcb) {
-        printf("PCB error in tcp_server_open\n");
+        printf("PCB error in tcp_server_open %s\n",pcb);
         return false;
     }
     err_t err = tcp_bind(pcb, IP_ANY_TYPE, TCP_PORT);
@@ -274,7 +284,10 @@ static bool tcp_server_open() {
     }
      
     struct tcp_pcb *server = tcp_listen_with_backlog(pcb, 1);
-    if (!server) return false;
+    if (!server) {
+        printf("Server error in struct tcp_pcb %s\n", server);
+        return false;
+    }
     tcp_accept(server, tcp_server_accept);
     return true;
 }
@@ -390,6 +403,7 @@ public:
     void draw()
     {
         struct timespec ct;
+        
         if (aon_timer_get_time(&ct))
         {
             int period = (ct.tv_sec % (3600 * 12));
@@ -482,10 +496,10 @@ int main()
     const float frame_delay_ms = 1000.0f / fps;
 
     // set basis brightness of matrix panel
-    driver.setBasisBrightness(8);
+    driver.setBasisBrightness(3);
 
     // set full brightness of panel
-    float intensity = 1.0f;
+    float intensity = 0.5f;
     driver.setIntensity(intensity);
 
     absolute_time_t next_frame = make_timeout_time_ms((uint32_t)frame_delay_ms);
