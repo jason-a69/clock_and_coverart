@@ -43,7 +43,7 @@ static bool aon_timer_is_initialised = false;
 #define IMG_SIZE (96 * 48 * 3)   // RGB888
 
 static uint8_t image_buf[IMG_SIZE];
-static uint8_t next_image_buf[IMG_SIZE];
+static uint8_t current_image_buf[IMG_SIZE];
 
 static size_t  recv_len = 0;
 static bool    image_ready = false;
@@ -227,7 +227,7 @@ void sntp_get_system_time_us(uint32_t *sec_ptr, uint32_t * us_ptr) {
 static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
     if (!p) {
         // connection closed
-        printf("In tcp_server_recv - connection closed");
+        printf("In tcp_server_recv - connection closed\n");
         tcp_close(tpcb);
         return ERR_OK;
     }
@@ -250,7 +250,7 @@ static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
             if (recv_len >= 8 + expected) {
                 // image complete – skip the 8-byte header
                 memmove(image_buf, image_buf + 8, expected);
-                printf("Received an image");
+                printf("Received an image\n");
                 image_ready = true;
                 recv_len = 0;          // ready for next image
             }
@@ -337,6 +337,199 @@ void initialize()
 }
 
 template <uint32_t W, uint32_t H>
+class RightSide : public AntialiasedLine<W, H>
+{
+private:
+    bool is_transitioning = false;
+    uint32_t transition_step = 0;
+    uint32_t active_transition = 0;
+    const uint32_t TOTAL_STEPS = 32; // Higher values = slower, smoother transitions
+
+    // Simple pseudo-random hash for noise effects without huge lookup tables
+    uint32_t hash_coor(int x, int y) {
+        uint32_t hash = y * 1327 + x * 4349;
+        hash = (hash ^ 61) ^ (hash >> 16);
+        hash += hash << 3;
+        hash ^= hash >> 4;
+        hash *= 0x27d4eb2d;
+        hash ^= hash >> 15;
+        return hash;
+    }
+
+public:
+    explicit RightSide(){};
+ 
+    void draw()
+    {
+        // 1. Trigger a random transition from the 10 available options when a new image arrives
+        if (image_ready && !is_transitioning) {
+            image_ready = false;
+            is_transitioning = true;
+            transition_step = 0;
+            active_transition = rand() % 10; // Picks a random transition index (0 to 9)
+        }
+
+        // 2. Perform rendering logic
+        if (is_transitioning) {
+            
+            for (int y = 0; y < IMG_H; ++y) {
+                for (int x = 0; x < IMG_W; ++x) {
+                    size_t idx = (y * IMG_W + x) * 3;
+
+                    uint8_t r = 0, g = 0, b = 0;
+
+                    // Fetch base old and new color data
+                    uint8_t r_old = current_image_buf[idx];
+                    uint8_t g_old = current_image_buf[idx + 1];
+                    uint8_t b_old = current_image_buf[idx + 2];
+
+                    uint8_t r_new = image_buf[idx];
+                    uint8_t g_new = image_buf[idx + 1];
+                    uint8_t b_new = image_buf[idx + 2];
+
+                    switch (active_transition) {
+                        case 0: // Cross-Fade (Dissolve Blend)
+                            r = ((r_old * (TOTAL_STEPS - transition_step)) + (r_new * transition_step)) / TOTAL_STEPS;
+                            g = ((g_old * (TOTAL_STEPS - transition_step)) + (g_new * transition_step)) / TOTAL_STEPS;
+                            b = ((b_old * (TOTAL_STEPS - transition_step)) + (b_new * transition_step)) / TOTAL_STEPS;
+                            break;
+
+                        case 1: // Vertical Wipe (Top-to-Bottom Sweep)
+                            if (transition_step > (uint32_t)((y * TOTAL_STEPS) / IMG_H)) {
+                                r = r_new; g = g_new; b = b_new;
+                            } else {
+                                r = r_old; g = g_old; b = b_old;
+                            }
+                            break;
+
+                        case 2: // Horizontal Slide (Left-to-Right Push)
+                            {
+                                int slide_offset = (transition_step * IMG_W) / TOTAL_STEPS;
+                                if (x < slide_offset) {
+                                    size_t new_idx = (y * IMG_W + (x + IMG_W - slide_offset)) * 3;
+                                    r = image_buf[new_idx]; g = image_buf[new_idx + 1]; b = image_buf[new_idx + 2];
+                                } else {
+                                    size_t old_idx = (y * IMG_W + (x - slide_offset)) * 3;
+                                    r = current_image_buf[old_idx]; g = current_image_buf[old_idx + 1]; b = current_image_buf[old_idx + 2];
+                                }
+                            }
+                            break;
+
+                        case 3: // Curtain Close (Expands out symmetrically from horizontal center)
+                            {
+                                int center_x = IMG_W / 2;
+                                int curtain_width = (transition_step * center_x) / TOTAL_STEPS;
+                                if (x >= (center_x - curtain_width) && x <= (center_x + curtain_width)) {
+                                    r = r_new; g = g_new; b = b_new;
+                                } else {
+                                    r = r_old; g = g_old; b = b_old;
+                                }
+                            }
+                            break;
+
+                        case 4: // Diagonal Wipe (Top-Left to Bottom-Right)
+                            if ((uint32_t)(((x + y) * TOTAL_STEPS) / (IMG_W + IMG_H)) < transition_step) {
+                                r = r_new; g = g_new; b = b_new;
+                            } else {
+                                r = r_old; g = g_old; b = b_old;
+                            }
+                            break;
+
+                        case 5: // Random Noise Dissolve (Per-pixel structural salt & pepper)
+                            if ((hash_coor(x, y) % TOTAL_STEPS) < transition_step) {
+                                r = r_new; g = g_new; b = b_new;
+                            } else {
+                                r = r_old; g = g_old; b = b_old;
+                            }
+                            break;
+
+                        case 6: // Block Matrix Dissolve (4x4 grids pattern reveal)
+                            {
+                                int bx = x / 4; int by = y / 4;
+                                if ((hash_coor(bx, by) % TOTAL_STEPS) < transition_step) {
+                                    r = r_new; g = g_new; b = b_new;
+                                } else {
+                                    r = r_old; g = g_old; b = b_old;
+                                }
+                            }
+                            break;
+
+                        case 7: // Circular Iris Reveal (Grows from center outwards)
+                            {
+                                int cx = IMG_W / 2; int cy = IMG_H / 2;
+                                int dx = x - cx; int dy = y - cy;
+                                int dist_sq = dx*dx + dy*dy;
+                                int max_radius_sq = cx*cx + cy*cy;
+                                int current_radius_sq = (transition_step * max_radius_sq) / TOTAL_STEPS;
+                                if (dist_sq <= current_radius_sq) {
+                                    r = r_new; g = g_new; b = b_new;
+                                } else {
+                                    r = r_old; g = g_old; b = b_old;
+                                }
+                            }
+                            break;
+
+                        case 8: // Dip to Black (Fades previous to dark, then rises new from dark)
+                            {
+                                uint32_t half_steps = TOTAL_STEPS / 2;
+                                if (transition_step <= half_steps) { 
+                                    r = (r_old * (half_steps - transition_step)) / half_steps;
+                                    g = (g_old * (half_steps - transition_step)) / half_steps;
+                                    b = (b_old * (half_steps - transition_step)) / half_steps;
+                                } else { 
+                                    uint32_t current_substep = transition_step - half_steps;
+                                    r = (r_new * current_substep) / half_steps;
+                                    g = (g_new * current_substep) / half_steps;
+                                    b = (b_new * current_substep) / half_steps;
+                                }
+                            }
+                            break;
+
+                        case 9: // Liquid Melt Reveal (Sweeps upward based on height)
+                            if (transition_step > (uint32_t)(((IMG_H - y) * TOTAL_STEPS) / IMG_H)) {
+                                r = r_new; g = g_new; b = b_new;
+                            } else {
+                                r = r_old; g = g_old; b = b_old;
+                            }
+                            break;
+                    }
+
+                    // Render pixel to the base canvas framework
+                    this->set_pen(this->create_pen(r, g, b));
+                    this->set_pixel(Point(OFFSET_X + x, OFFSET_Y + y));
+                }
+            }
+
+            // Progress the animation timeline coordinate step forward
+            transition_step++;
+
+            // 3. Clean up and lock buffers once the active transition concludes
+            if (transition_step > TOTAL_STEPS) {
+                is_transitioning = false;
+                memcpy(current_image_buf, image_buf, sizeof(image_buf));
+                memset(image_buf, 0, sizeof(image_buf));
+            }
+        }
+        else {
+            // Static Rendering Fallback: Draws active canvas image when idle
+            for (int y = 0; y < IMG_H; ++y) {
+                for (int x = 0; x < IMG_W; ++x) {
+                    size_t idx = (y * IMG_W + x) * 3;
+
+                    uint8_t r = current_image_buf[idx];
+                    uint8_t g = current_image_buf[idx + 1];
+                    uint8_t b = current_image_buf[idx + 2];
+
+                    this->set_pen(this->create_pen(r, g, b));
+                    this->set_pixel(Point(OFFSET_X + x, OFFSET_Y + y));
+                }
+            }
+        }
+    }
+};
+
+
+template <uint32_t W, uint32_t H>
 class AnalogClock : public AntialiasedLine<W, H>
 {
 private:
@@ -357,8 +550,6 @@ private:
 
     int previous_second = second;
 
-    int textScrollX = 64;
-
     constexpr static uint32_t hour_hand = 0x1bb1e7;          // #1bb1e7
     constexpr static int32_t minute_hand = 0x11819d;         // #11819d
     constexpr static uint32_t second_hand = 0xF3D459;        // #F3D459
@@ -368,16 +559,32 @@ private:
     constexpr static uint32_t main_ticks = 0xffffff;   // #ffffff
     constexpr static uint32_t clock_digits = 0x7A263A; // #7A263A
 
+    
+    // All this transition code was generated by Gemini, I cannot take credit for this
+    bool is_transitioning = false;
+    uint32_t transition_step = 0;
+    uint32_t active_transition = 0;
+    const uint32_t TOTAL_STEPS = 32; // Higher values = slower, smoother transitions
+
+    // Simple pseudo-random hash for noise effects without huge lookup tables
+    uint32_t hash_coor(int x, int y) {
+        uint32_t hash = y * 1327 + x * 4349;
+        hash = (hash ^ 61) ^ (hash >> 16);
+        hash += hash << 3;
+        hash ^= hash >> 4;
+        hash *= 0x27d4eb2d;
+        hash ^= hash >> 15;
+        return hash;
+    }
+
 public:
     explicit AnalogClock()
     {
-        //get_time();
 
         centerX = (float)(W / 2);
         centerY = (float)(H / 2);
 
         l = std::min(W, H);
-
 
         r = l * (0.95f / 2.0f);
 
@@ -412,7 +619,7 @@ public:
             second = (period - hour * 3600 - minute * 60);
         }
 
-        // only update frame buffer when second has changed
+        // Only update frame buffer for the clock when second has changed. Whilst it's waiting take care of the cover art on the right
         if (second != previous_second)
         {
             previous_second = second;
@@ -458,17 +665,165 @@ public:
             this->drawLine(c[second] * 0.1f + localCenterX + 1, s[second] * 0.1f + centerY + 1, -c[second] * 0.85f + localCenterX, -s[second] * 0.85f + centerY, second_shadow_hand);
             this->drawLine(c[second] * 0.1f + localCenterX, s[second] * 0.1f + centerY, -c[second] * 0.85f + localCenterX, -s[second] * 0.85f + centerY, second_hand);
           
-            if (image_ready) {
-
+        } else {
+            // While we are saiting for the next second, trigger a random transition from the 10 available options when a new image arrives
+            if (image_ready && !is_transitioning) {
                 image_ready = false;
-                // Draw the BMP on the right side of the screen
+                is_transitioning = true;
+                transition_step = 0;
+                active_transition = rand() % 10; // Picks a random transition index (0 to 9)
+            }
+
+            // 2. Perform rendering logic
+            if (is_transitioning) {
+            
                 for (int y = 0; y < IMG_H; ++y) {
                     for (int x = 0; x < IMG_W; ++x) {
                         size_t idx = (y * IMG_W + x) * 3;
 
-                        uint8_t r = image_buf[idx];
-                        uint8_t g = image_buf[idx + 1];
-                        uint8_t b = image_buf[idx + 2];
+                        uint8_t r = 0, g = 0, b = 0;
+
+                        // Fetch base old and new color data
+                        uint8_t r_old = current_image_buf[idx];
+                        uint8_t g_old = current_image_buf[idx + 1];
+                        uint8_t b_old = current_image_buf[idx + 2];
+
+                        uint8_t r_new = image_buf[idx];
+                        uint8_t g_new = image_buf[idx + 1];
+                        uint8_t b_new = image_buf[idx + 2];
+
+                        switch (active_transition) {
+                            case 0: // Cross-Fade (Dissolve Blend)
+                                r = ((r_old * (TOTAL_STEPS - transition_step)) + (r_new * transition_step)) / TOTAL_STEPS;
+                                g = ((g_old * (TOTAL_STEPS - transition_step)) + (g_new * transition_step)) / TOTAL_STEPS;
+                                b = ((b_old * (TOTAL_STEPS - transition_step)) + (b_new * transition_step)) / TOTAL_STEPS;
+                                break;
+
+                            case 1: // Vertical Wipe (Top-to-Bottom Sweep)
+                                if (transition_step > (uint32_t)((y * TOTAL_STEPS) / IMG_H)) {
+                                    r = r_new; g = g_new; b = b_new;
+                                } else {
+                                    r = r_old; g = g_old; b = b_old;
+                                }
+                                break;
+
+                            case 2: // Horizontal Slide (Left-to-Right Push)
+                                {
+                                    int slide_offset = (transition_step * IMG_W) / TOTAL_STEPS;
+                                    if (x < slide_offset) {
+                                        size_t new_idx = (y * IMG_W + (x + IMG_W - slide_offset)) * 3;
+                                        r = image_buf[new_idx]; g = image_buf[new_idx + 1]; b = image_buf[new_idx + 2];
+                                    } else {
+                                        size_t old_idx = (y * IMG_W + (x - slide_offset)) * 3;
+                                        r = current_image_buf[old_idx]; g = current_image_buf[old_idx + 1]; b = current_image_buf[old_idx + 2];
+                                    }
+                                }
+                                break;
+
+                            case 3: // Curtain Close (Expands out symmetrically from horizontal center)
+                                {
+                                    int center_x = IMG_W / 2;
+                                    int curtain_width = (transition_step * center_x) / TOTAL_STEPS;
+                                    if (x >= (center_x - curtain_width) && x <= (center_x + curtain_width)) {
+                                        r = r_new; g = g_new; b = b_new;
+                                    } else {
+                                        r = r_old; g = g_old; b = b_old;
+                                    }
+                                }
+                                break;
+
+                            case 4: // Diagonal Wipe (Top-Left to Bottom-Right)
+                                if ((uint32_t)(((x + y) * TOTAL_STEPS) / (IMG_W + IMG_H)) < transition_step) {
+                                    r = r_new; g = g_new; b = b_new;
+                                } else {
+                                    r = r_old; g = g_old; b = b_old;
+                                }
+                                break;
+
+                            case 5: // Random Noise Dissolve (Per-pixel structural salt & pepper)
+                                if ((hash_coor(x, y) % TOTAL_STEPS) < transition_step) {
+                                    r = r_new; g = g_new; b = b_new;
+                                } else {
+                                    r = r_old; g = g_old; b = b_old;
+                                }
+                                break;
+
+                            case 6: // Block Matrix Dissolve (4x4 grids pattern reveal)
+                                {
+                                    int bx = x / 4; int by = y / 4;
+                                    if ((hash_coor(bx, by) % TOTAL_STEPS) < transition_step) {
+                                        r = r_new; g = g_new; b = b_new;
+                                    } else {
+                                        r = r_old; g = g_old; b = b_old;
+                                    }
+                                }
+                                break;
+
+                            case 7: // Circular Iris Reveal (Grows from center outwards)
+                                {
+                                    int cx = IMG_W / 2; int cy = IMG_H / 2;
+                                    int dx = x - cx; int dy = y - cy;
+                                    int dist_sq = dx*dx + dy*dy;
+                                    int max_radius_sq = cx*cx + cy*cy;
+                                    int current_radius_sq = (transition_step * max_radius_sq) / TOTAL_STEPS;
+                                    if (dist_sq <= current_radius_sq) {
+                                        r = r_new; g = g_new; b = b_new;
+                                    } else {
+                                        r = r_old; g = g_old; b = b_old;
+                                    }
+                                }
+                                break;
+
+                            case 8: // Dip to Black (Fades previous to dark, then rises new from dark)
+                                {
+                                    uint32_t half_steps = TOTAL_STEPS / 2;
+                                    if (transition_step <= half_steps) { 
+                                        r = (r_old * (half_steps - transition_step)) / half_steps;
+                                        g = (g_old * (half_steps - transition_step)) / half_steps;
+                                        b = (b_old * (half_steps - transition_step)) / half_steps;
+                                    } else { 
+                                        uint32_t current_substep = transition_step - half_steps;
+                                        r = (r_new * current_substep) / half_steps;
+                                        g = (g_new * current_substep) / half_steps;
+                                        b = (b_new * current_substep) / half_steps;
+                                    }
+                                }
+                                break;
+
+                            case 9: // Liquid Melt Reveal (Sweeps upward based on height)
+                                if (transition_step > (uint32_t)(((IMG_H - y) * TOTAL_STEPS) / IMG_H)) {
+                                    r = r_new; g = g_new; b = b_new;
+                                } else {
+                                    r = r_old; g = g_old; b = b_old;
+                                }
+                                break;
+                        }
+
+                        // Render pixel to the base canvas framework
+                        this->set_pen(this->create_pen(r, g, b));
+                        this->set_pixel(Point(OFFSET_X + x, OFFSET_Y + y));
+                    }
+                }
+
+                // Progress the animation timeline coordinate step forward
+                transition_step++;
+
+                // 3. Clean up and lock buffers once the active transition concludes
+                if (transition_step > TOTAL_STEPS) {
+                    is_transitioning = false;
+                    memcpy(current_image_buf, image_buf, sizeof(image_buf));
+                    memset(image_buf, 0, sizeof(image_buf));
+                }
+            }
+            else {
+                // Static Rendering Fallback: Draws active canvas image when idle
+                for (int y = 0; y < IMG_H; ++y) {
+                    for (int x = 0; x < IMG_W; ++x) {
+                        size_t idx = (y * IMG_W + x) * 3;
+
+                        uint8_t r = current_image_buf[idx];
+                        uint8_t g = current_image_buf[idx + 1];
+                        uint8_t b = current_image_buf[idx + 2];
 
                         this->set_pen(this->create_pen(r, g, b));
                         this->set_pixel(Point(OFFSET_X + x, OFFSET_Y + y));
@@ -476,8 +831,9 @@ public:
                 }
             }
         }
-
+        
     }
+
 };
 
 
@@ -506,8 +862,7 @@ int main()
     {
         analogClock.draw();
         driver.update(&analogClock);
-        
- 
+
         sleep_until(next_frame);
         next_frame = delayed_by_ms(next_frame, (uint32_t)frame_delay_ms);
     }
