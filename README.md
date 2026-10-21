@@ -1,3 +1,11 @@
+
+
+https://github.com/user-attachments/assets/7b6dc58a-73dd-4b02-bbbb-5923e1235b79
+
+
+
+
+
 Program designed to run on pico2 w its main purpose is to display a clock and coverart on a waveshare 96x48 RGB Matrix
 
 This would not have been possible without the excellent hub75 driver published at 
