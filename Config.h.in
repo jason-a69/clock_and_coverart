@@ -1,0 +1,16 @@
+#pragma once
+
+#define WIFI_SSID       "@SECRET_WIFI_SSID@"
+#define WIFI_PASSWORD   "@SECRET_WIFI_PASSWORD@"
+#define TZ              "@SECRET_TZ@"
+
+#define STATIC_IP       "@SECRET_STATIC_IP@"
+#define NETMASK         "@SECRET_NETMASK@"
+#define GATEWAY         "@SECRET_GATEWAY@"
+
+#define WEATHER_LAT     "@SECRET_WEATHER_LAT@"
+#define WEATHER_LON     "@SECRET_WEATHER_LON@"
+
+#define CARTOONS        "@SECRET_CARTOONS@"
+
+#define BED_TIME        "@SECRET_BED_TIME@"

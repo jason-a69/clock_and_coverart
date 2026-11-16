@@ -1,0 +1,33 @@
+{
+    "name": "hub75",
+    "version": "1.6.0",
+    "description": "Hub75 LED matrix panel driver for Raspberry Pi Pico",
+    "keywords": "Pico, RP2040, RP2350, RP2350B, HUB75, C-SDK, PIO, DMA, Driver",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/JuPfu/hub75"
+    },
+    "authors": [
+        {
+            "name": "Jürgen Pfundt",
+            "email": "juergen.pfundt@gmail.com",
+            "url": "https://github.com/JuPfu",
+            "maintainer": true
+        }
+        {
+            "name": "Christoph Mair",
+            "email": "christoph.mair@gmail.com",
+            "url": "https://github.com/cmair",
+            "maintainer": true
+        }
+    ],
+    "license": "MIT",
+    "homepage": "https://github.com/JuPfu/hub75",
+    "frameworks": "arduino",
+    "platforms": "raspberrypi",
+    "build": {
+        "srcDir": "src",
+        "srcFilter": "+<*>"
+    },
+    "headers": "hub75.hpp"
+}
